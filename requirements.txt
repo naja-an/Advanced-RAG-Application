@@ -1,0 +1,16 @@
+langchain-docling
+faiss-cpu
+rank_bm25
+langchain-google-genai
+python-dotenv
+docling
+langchain
+langchain-community
+langchain-core
+langchain-classic
+sentence-transformers
+langfuse
+fastapi
+uvicorn[standard]
+python-multipart
+deepeval
