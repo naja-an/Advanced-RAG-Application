@@ -71,6 +71,7 @@
         <div class="metric"><span class="metric-label">Faithfulness</span><span class="metric-value" id="faithfulness">--</span></div>
         <div class="metric"><span class="metric-label">Overall latency</span><span class="metric-value" id="latency">--</span></div>
       </div>
+      <p id="evaluation-status" aria-live="polite"></p>
       <p id="evaluation-error" hidden></p>
     </section>
   </main>
@@ -89,9 +90,11 @@
     const answerRelevance = document.querySelector('#answer-relevance');
     const faithfulness = document.querySelector('#faithfulness');
     const latency = document.querySelector('#latency');
+    const evaluationStatus = document.querySelector('#evaluation-status');
     const evaluationError = document.querySelector('#evaluation-error');
     const selectedFilesLabel = document.querySelector('#selected-files');
     let selectedFiles = [];
+    let evaluationRequestNumber = 0;
 
     function renderSelectedFiles() {
       selectedFilesLabel.replaceChildren();
@@ -174,17 +177,38 @@
       status.append(disclosure);
     }
 
-    function showEvaluation(evaluation = {}) {
+    function showEvaluation(evaluation = {}, taskStatus = 'completed') {
       const formatScore = score => Number.isFinite(score)
         ? `${(score * 100).toFixed(1)}%`
-        : 'Unavailable';
+        : taskStatus === 'pending' ? 'Pending' : 'Unavailable';
       answerRelevance.textContent = formatScore(evaluation.answer_relevance);
       faithfulness.textContent = formatScore(evaluation.faithfulness);
       latency.textContent = Number.isFinite(evaluation.latency_ms)
         ? `${Math.round(evaluation.latency_ms)} ms`
         : 'Unavailable';
+      evaluationStatus.textContent = taskStatus === 'pending' ? 'Evaluation in progress...' : '';
       evaluationError.textContent = evaluation.error || '';
       evaluationError.hidden = !evaluation.error;
+    }
+
+    async function pollEvaluation(evaluationId, requestNumber) {
+      const url = `/sessions/${sessionId}/evaluations/${evaluationId}`;
+      try {
+        while (requestNumber === evaluationRequestNumber) {
+          await new Promise(resolve => setTimeout(resolve, 750));
+          const response = await fetch(url, { cache: 'no-store' });
+          if (!response.ok) throw new Error(await readError(response));
+          const task = await response.json();
+          if (requestNumber !== evaluationRequestNumber) return;
+          showEvaluation(task.evaluation || {}, task.status);
+          if (task.status !== 'pending') return;
+        }
+      } catch (error) {
+        if (requestNumber !== evaluationRequestNumber) return;
+        evaluationStatus.textContent = '';
+        evaluationError.textContent = `Evaluation status unavailable: ${error.message}`;
+        evaluationError.hidden = false;
+      }
     }
 
     async function readError(response) {
@@ -203,6 +227,7 @@
         const response = await fetch('/sessions', { method: 'POST' });
         if (!response.ok) throw new Error(await readError(response));
         const session = await response.json();
+        evaluationRequestNumber += 1;
         sessionId = session.session_id;
         sessionLabel.textContent = sessionId;
         uploadButton.disabled = false;
@@ -250,6 +275,7 @@
     askButton.addEventListener('click', async () => {
       const question = questionInput.value.trim();
       if (!question || !sessionId) return;
+      const requestNumber = ++evaluationRequestNumber;
       askButton.disabled = true;
       showStatus('Generating answer...');
       try {
@@ -261,8 +287,9 @@
         if (!response.ok) throw new Error(await readError(response));
         const result = await response.json();
         answer.textContent = result.answer;
-        showEvaluation(result.evaluation);
+        showEvaluation(result.evaluation, 'pending');
         showAnswerSources(result.sources || []);
+        void pollEvaluation(result.evaluation_id, requestNumber);
       } catch (error) {
         showStatus(`Chat failed: ${error.message}`, 'error');
       } finally {

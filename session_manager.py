@@ -7,7 +7,7 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from document_processor import create_session_storage, remove_session_storage
-from models import DocumentResponse, SessionResponse
+from models import DocumentResponse, EvaluationTaskResponse, SessionResponse
 
 
 @dataclass
@@ -16,6 +16,7 @@ class SessionState:
 	created_at: datetime
 	expires_at: datetime | None = None
 	documents: dict[UUID, DocumentResponse] = field(default_factory=dict)
+	evaluation_tasks: dict[UUID, EvaluationTaskResponse] = field(default_factory=dict)
 	loaded_documents: list[object] = field(default_factory=list)
 	storage_dir: Path = field(default_factory=create_session_storage)
 	pipeline: object | None = None
@@ -68,6 +69,23 @@ class SessionManager:
 	def set_pipeline(self, session_id: UUID, pipeline: object) -> None:
 		with self._lock:
 			self.get(session_id).pipeline = pipeline
+
+	def set_evaluation(
+		self,
+		session_id: UUID,
+		evaluation_id: UUID,
+		evaluation: EvaluationTaskResponse,
+	) -> None:
+		with self._lock:
+			self.get(session_id).evaluation_tasks[evaluation_id] = evaluation
+
+	def get_evaluation(
+		self,
+		session_id: UUID,
+		evaluation_id: UUID,
+	) -> EvaluationTaskResponse | None:
+		with self._lock:
+			return self.get(session_id).evaluation_tasks.get(evaluation_id)
 
 	def delete(self, session_id: UUID) -> None:
 		with self._lock:

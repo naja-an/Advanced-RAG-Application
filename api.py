@@ -5,10 +5,10 @@ import logging
 import os
 from time import perf_counter
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
-from fastapi import File, FastAPI, Form, HTTPException, UploadFile, status
+from fastapi import BackgroundTasks, File, FastAPI, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
@@ -17,12 +17,13 @@ from document_processor import (
 	create_vectorstore,
 	ingest_sources,
 )
-from evaluation import evaluate_answer
+from evaluation_tasks import run_answer_evaluation
 from models import (
 	ChatRequest,
 	ChatResponse,
 	DocumentResponse,
 	EvaluationResponse,
+	EvaluationTaskResponse,
 	ErrorResponse,
 	SessionResponse,
 	SourceResponse,
@@ -43,7 +44,7 @@ app = FastAPI(
 	description="Session-based API for document-grounded conversations.",
 )
 session_manager = SessionManager()
-UI_PATH = __file__.replace("api.py", "static/index.html")
+UI_PATH = __file__.replace("api.py", "frontend/index.html")
 langfuse_handler = create_langfuse_handler()
 
 
@@ -106,6 +107,22 @@ async def delete_session(session_id: UUID) -> None:
 async def list_documents(session_id: UUID) -> list[DocumentResponse]:
 	_session_or_404(session_id)
 	return session_manager.list_documents(session_id)
+
+
+@app.get(
+	"/sessions/{session_id}/evaluations/{evaluation_id}",
+	response_model=EvaluationTaskResponse,
+	responses={404: {"model": ErrorResponse}},
+)
+async def get_evaluation(session_id: UUID, evaluation_id: UUID) -> EvaluationTaskResponse:
+	_session_or_404(session_id)
+	evaluation = session_manager.get_evaluation(session_id, evaluation_id)
+	if evaluation is None:
+		raise HTTPException(
+			status_code=status.HTTP_404_NOT_FOUND,
+			detail=f"Evaluation {evaluation_id} was not found",
+		)
+	return evaluation
 
 
 @app.post(
@@ -192,7 +209,11 @@ async def add_documents(
 	response_model=ChatResponse,
 	responses={404: {"model": ErrorResponse}},
 )
-async def chat(session_id: UUID, request: ChatRequest) -> ChatResponse:
+async def chat(
+	session_id: UUID,
+	request: ChatRequest,
+	background_tasks: BackgroundTasks,
+) -> ChatResponse:
 	started_at = perf_counter()
 	session = _session_or_404(session_id)
 	if session.pipeline is None:
@@ -221,33 +242,36 @@ async def chat(session_id: UUID, request: ChatRequest) -> ChatResponse:
 			status_code=status.HTTP_502_BAD_GATEWAY,
 			detail=str(error),
 		) from error
-	try:
-		evaluation = await asyncio.to_thread(
-			evaluate_answer,
-			request.question,
-			result["answer"],
-			[document.page_content for document in result["documents"]],
-		)
-	except Exception as error:
-		logger.exception("answer_evaluation_unavailable session_id=%s", session_id)
-		evaluation = {
-			"answer_relevance": None,
-			"faithfulness": None,
-			"error": f"Evaluation unavailable: {type(error).__name__}",
-		}
-	evaluation["latency_ms"] = round((perf_counter() - started_at) * 1000, 1)
+	latency = round((perf_counter() - started_at) * 1000, 1)
+	evaluation_id = uuid4()
+	session_manager.set_evaluation(
+		session_id,
+		evaluation_id,
+		EvaluationTaskResponse(status="pending"),
+	)
+	background_tasks.add_task(
+		run_answer_evaluation,
+		session_manager,
+		session_id,
+		evaluation_id,
+		request.question,
+		result["answer"],
+		[document.page_content for document in result["documents"]],
+		latency,
+	)
 	logger.info(
 		"chat_completed session_id=%s source_count=%d duration_ms=%d",
 		session_id,
 		len(result["documents"]),
-		int(evaluation["latency_ms"]),
+		int(latency),
 	)
 
 	return ChatResponse(
 		question=request.question,
 		query_used_for_retrieval=request.question,
 		answer=result["answer"],
-		evaluation=EvaluationResponse(**evaluation),
+		evaluation=EvaluationResponse(latency_ms=latency),
+		evaluation_id=evaluation_id,
 		sources=[
 			SourceResponse(
 				metadata=document.metadata,

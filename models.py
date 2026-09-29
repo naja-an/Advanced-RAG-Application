@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import AnyHttpUrl, BaseModel, Field
@@ -57,12 +57,18 @@ class EvaluationResponse(BaseModel):
 	error: str | None = None
 
 
+class EvaluationTaskResponse(BaseModel):
+	status: Literal["pending", "completed", "failed"]
+	evaluation: EvaluationResponse | None = None
+
+
 class ChatResponse(BaseModel):
 	question: str
 	query_used_for_retrieval: str
 	answer: str
 	sources: list[SourceResponse] = Field(default_factory=list)
 	evaluation: EvaluationResponse
+	evaluation_id: UUID
 
 
 class MessageResponse(BaseModel):
