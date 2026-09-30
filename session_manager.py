@@ -2,18 +2,22 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from threading import RLock
 from uuid import UUID, uuid4
 
 from document_processor import create_session_storage, remove_session_storage
-from models import DocumentResponse, EvaluationTaskResponse, SessionResponse
+from conversation_store import ConversationStore
+from models import ChatTurnResponse, DocumentResponse, EvaluationTaskResponse, SessionResponse
+from rag import ConversationMemory
 
 
 @dataclass
 class SessionState:
 	session_id: UUID
 	created_at: datetime
+	memory: ConversationMemory
 	expires_at: datetime | None = None
 	documents: dict[UUID, DocumentResponse] = field(default_factory=dict)
 	evaluation_tasks: dict[UUID, EvaluationTaskResponse] = field(default_factory=dict)
@@ -29,13 +33,23 @@ class SessionNotFoundError(KeyError):
 class SessionManager:
 	"""Thread-safe in-memory session registry for the initial API implementation."""
 
-	def __init__(self) -> None:
+	def __init__(self, database_path: Path | None = None) -> None:
 		self._sessions: dict[UUID, SessionState] = {}
 		self._lock = RLock()
+		default_path = Path(__file__).resolve().parent / "data" / "conversations.sqlite3"
+		self.conversation_store = ConversationStore(
+			Path(os.getenv("RAG_DATABASE_PATH", default_path)) if database_path is None else database_path
+		)
 
 	def create(self) -> SessionResponse:
 		now = datetime.now(timezone.utc)
-		state = SessionState(session_id=uuid4(), created_at=now)
+		session_id = uuid4()
+		state = SessionState(
+			session_id=session_id,
+			created_at=now,
+			memory=ConversationMemory(session_id, self.conversation_store),
+		)
+		self.conversation_store.create_session(session_id, now)
 		with self._lock:
 			self._sessions[state.session_id] = state
 		return SessionResponse(
@@ -50,6 +64,12 @@ class SessionManager:
 		if state is None:
 			raise SessionNotFoundError(session_id)
 		return state
+
+	def list_history(self, session_id: UUID) -> list[ChatTurnResponse] | None:
+		turns = self.conversation_store.list_turns(session_id)
+		if turns is None:
+			return None
+		return [ChatTurnResponse.model_validate(turn) for turn in turns]
 
 	def list_documents(self, session_id: UUID) -> list[DocumentResponse]:
 		return list(self.get(session_id).documents.values())
@@ -92,4 +112,5 @@ class SessionManager:
 			state = self._sessions.pop(session_id, None)
 			if state is None:
 				raise SessionNotFoundError(session_id)
+			self.conversation_store.delete_session(session_id)
 		remove_session_storage(state.storage_dir)

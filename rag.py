@@ -13,6 +13,7 @@ so there are no tool messages to trim and the context stays small.
 import asyncio
 import logging
 from functools import lru_cache
+from uuid import UUID
 
 from langchain_classic.retrievers import BM25Retriever, ContextualCompressionRetriever, EnsembleRetriever
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
@@ -24,6 +25,7 @@ from langfuse import observe
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 
 from document_processor import normalize_for_lexical_search
+from conversation_store import ConversationStore
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +36,9 @@ Cite supporting passages as [Source N].
 If the passages do not contain the answer, reply exactly: "{NOT_FOUND_MESSAGE}"
 Earlier conversation turns are for continuity only; never use them as a source of facts."""
 
-CONDENSE_PROMPT = """Rewrite the user's latest question as a single standalone search query,
+REWRITE_QUERY_PROMPT = """Rewrite the user's latest question as a single standalone search query,
 resolving pronouns and references using the conversation. Do not answer it.
+Do not remove any instructions for answer formats like "explain in bullets", "answer in one sentence", etc.
 If it is already standalone, return it unchanged. Output only the query."""
 
 
@@ -67,26 +70,40 @@ def is_transient(exc: BaseException) -> bool:
 # Conversation memory (lives on the session, survives pipeline rebuilds)
 # --------------------------------------------------------------------------- #
 class ConversationMemory:
-    """Sliding window of the last `max_turns` (question, answer) pairs as plain text."""
+    """SQLite-backed turn history with a bounded window for LLM prompt context."""
 
-    def __init__(self, max_turns: int = 6, max_chars_per_message: int = 2000):
+    def __init__(
+        self,
+        session_id: UUID,
+        store: ConversationStore,
+        max_turns: int = 6,
+        max_chars_per_message: int = 2000,
+    ):
+        self.session_id = session_id
+        self.store = store
         self.max_turns = max_turns
         self.max_chars = max_chars_per_message
-        self._messages: list[BaseMessage] = []
         self.lock = asyncio.Lock()  # serialises turns within one session
 
     def messages(self) -> list[BaseMessage]:
-        return list(self._messages)
-
-    def add_turn(self, question: str, answer: str) -> None:
-        self._messages += [
-            HumanMessage(question[: self.max_chars]),
-            AIMessage(answer[: self.max_chars]),
+        return [
+            HumanMessage(content=text) if role == "human" else AIMessage(content=text)
+            for text, role in self.store.prompt_messages(
+                self.session_id, self.max_turns, self.max_chars
+            )
         ]
-        self._messages = self._messages[-2 * self.max_turns:]
 
-    def clear(self) -> None:
-        self._messages.clear()
+    def add_turn(self, question: str, query: str, answer: str, documents: list[Document]) -> None:
+        self.store.add_turn(
+            self.session_id,
+            question,
+            query,
+            answer,
+            [
+                {"metadata": document.metadata, "content": document.page_content}
+                for document in documents
+            ],
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -98,6 +115,11 @@ def get_reranker_model(name: str = "BAAI/bge-reranker-base") -> HuggingFaceCross
 
 
 class RAGPipeline:
+    """Defines a complete RAG pipeline.
+    Step 1: Rewrites the user query based on the chat history context to enhance the search results.
+    Step 2: Uses a hybrid search retrieve: BM25 and vector search, combines the results and reranks them using a cross encoder model.
+    Step 3: Generates the answer along with citations using the search results as the context.
+    """
     def __init__(
         self,
         llm,
@@ -114,7 +136,6 @@ class RAGPipeline:
         self.docs = docs
         self.max_attempts = max_attempts
         self.llm_timeout_s = llm_timeout_s
-        self.memory = ConversationMemory()
 
         vector_retriever = vectorstore.as_retriever(search_kwargs={"k": vector_k})
         bm25_retriever = BM25Retriever.from_documents(docs, preprocess_func=normalize_for_lexical_search)
@@ -147,7 +168,8 @@ class RAGPipeline:
         return str(content).strip()
 
     # ---- step 1: condense --------------------------------------------------- #
-    async def _standalone_query(self, question: str, history: list[BaseMessage], config) -> str:
+    async def _rewrite_query(self, question: str, history: list[BaseMessage], config) -> str:
+        """Rewrite the user query for better retrieval results."""
         if not history:  # first turn: no LLM call needed
             return question
         transcript = "\n".join(
@@ -155,18 +177,19 @@ class RAGPipeline:
         )
         try:
             reply = await self._llm_call(
-                [SystemMessage(CONDENSE_PROMPT),
+                [SystemMessage(REWRITE_QUERY_PROMPT),
                  HumanMessage(f"Conversation:\n{transcript}\n\nLatest question: {question}")],
                 config,
             )
             return self._text(reply) or question
-        except Exception as e:  # condensing is an optimisation; never fail the turn on it
+        except Exception as e:
             logger.warning("condense_failed, using raw question: %s", type(e).__name__)
             return question
 
     # ---- step 2: retrieve --------------------------------------------------- #
     @observe(name="rag.retrieve_documents")
     async def retrieve_documents(self, query: str) -> list[Document]:
+        """Retrieve documents based on the query from the vector database."""
         documents = await self.retriever.ainvoke(query)
         logger.debug("retrieval_completed document_count=%d", len(documents))
         return documents
@@ -174,12 +197,12 @@ class RAGPipeline:
     # ---- step 3: generate --------------------------------------------------- #
     @observe(name="rag.generate_answer")
     async def generate_answer(
-        self, question: str, config: RunnableConfig | None = None
+        self, question: str, memory: ConversationMemory, config: RunnableConfig | None = None
     ) -> dict:
         try:
-            async with self.memory.lock:
-                history = self.memory.messages()
-                query = await self._standalone_query(question, history, config)
+            async with memory.lock:
+                history = memory.messages()
+                query = await self._rewrite_query(question, history, config)
                 documents = await self.retrieve_documents(query)
 
                 if not documents:
@@ -195,7 +218,7 @@ class RAGPipeline:
                     )
                     answer = self._text(reply)
 
-                self.memory.add_turn(question, answer)  # text only - chunks are never stored
+                memory.add_turn(question, query, answer, documents)
             return {"answer": answer, "documents": documents, "query_used_for_retrieval": query}
         except Exception as e:
             logger.error("answer_generation_failed: %s", e)

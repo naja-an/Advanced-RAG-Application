@@ -22,13 +22,19 @@
     .remove-file { flex: none; padding: 6px 10px; background: #8b2e2e; }
     #session { font-family: ui-monospace, monospace; font-size: .84rem; word-break: break-all; }
     #status { margin-top: 22px; padding: 12px; border-radius: 7px; background: #f3f6f8; white-space: pre-wrap; }
-    #status .source-disclosure { white-space: normal; }
     .source-disclosure summary { cursor: pointer; font-weight: 650; }
     .source-list { display: grid; gap: 0; margin: 12px 0 0; padding-left: 24px; }
     .source-list li { padding: 12px 4px; border-top: 1px solid #c6d8cc; }
     .source-heading { margin: 0; font-size: 1rem; overflow-wrap: anywhere; }
     .source-list p { margin: 6px 0 0; color: inherit; font-size: .9rem; line-height: 1.5; white-space: normal; }
-    #answer { margin-top: 12px; padding: 12px; border: 1px solid #d8e0e8; border-radius: 7px; white-space: pre-wrap; }
+    #conversation { display: grid; gap: 16px; margin-top: 18px; }
+    .turn { display: grid; gap: 10px; }
+    .message { max-width: 90%; padding: 12px; border: 1px solid #d8e0e8; border-radius: 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message.user { justify-self: end; background: #eaf2f8; }
+    .message.assistant { justify-self: start; background: #f5f7f8; }
+    .message-role { display: block; margin-bottom: 5px; color: #52606d; font-size: .8rem; font-weight: 700; }
+    .message-content { margin: 0; }
+    .message .source-disclosure { margin-top: 10px; white-space: normal; }
     #evaluation { margin-top: 12px; padding-top: 12px; border-top: 1px solid #d8e0e8; }
     #evaluation h2 { margin: 0 0 10px; font-size: 1rem; }
     .metric-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
@@ -63,7 +69,9 @@
     </div>
 
     <div id="status" role="status">Ready.</div>
-    <div id="answer" aria-live="polite">No answer yet.</div>
+    <section id="conversation" aria-live="polite" aria-label="Conversation">
+      <p id="empty-conversation">No messages yet.</p>
+    </section>
     <section id="evaluation" aria-live="polite" aria-label="Answer evaluation">
       <h2>Turn metrics</h2>
       <div class="metric-list">
@@ -86,7 +94,7 @@
     const questionInput = document.querySelector('#question');
     const sessionLabel = document.querySelector('#session');
     const status = document.querySelector('#status');
-    const answer = document.querySelector('#answer');
+    const conversation = document.querySelector('#conversation');
     const answerRelevance = document.querySelector('#answer-relevance');
     const faithfulness = document.querySelector('#faithfulness');
     const latency = document.querySelector('#latency');
@@ -95,6 +103,101 @@
     const selectedFilesLabel = document.querySelector('#selected-files');
     let selectedFiles = [];
     let evaluationRequestNumber = 0;
+
+    function renderTurn(turn) {
+      const article = document.createElement('article');
+      article.className = 'turn';
+
+      const userMessage = document.createElement('div');
+      userMessage.className = 'message user';
+      const userRole = document.createElement('span');
+      userRole.className = 'message-role';
+      userRole.textContent = 'You';
+      const question = document.createElement('p');
+      question.className = 'message-content';
+      question.textContent = turn.question;
+      userMessage.append(userRole, question);
+
+      const assistantMessage = document.createElement('div');
+      assistantMessage.className = 'message assistant';
+      const assistantRole = document.createElement('span');
+      assistantRole.className = 'message-role';
+      assistantRole.textContent = 'Assistant';
+      const answer = document.createElement('p');
+      answer.className = 'message-content';
+      answer.textContent = turn.answer;
+      assistantMessage.append(assistantRole, answer);
+
+      const sources = turn.sources || [];
+      if (sources.length) {
+        const disclosure = document.createElement('details');
+        disclosure.className = 'source-disclosure';
+        const summary = document.createElement('summary');
+        summary.textContent = `Sources (${sources.length})`;
+        const sourceList = document.createElement('ol');
+        sourceList.className = 'source-list';
+        sources.forEach((source, index) => {
+          const item = document.createElement('li');
+          const metadata = source.metadata || {};
+          const label = metadata.title || metadata.filename || metadata.file_name || metadata.source || metadata.url;
+          const heading = document.createElement('h3');
+          heading.className = 'source-heading';
+          heading.textContent = typeof label === 'string' ? label : `Source ${index + 1}`;
+          item.append(heading);
+          const excerpt = (source.content || '').replace(/\s+/g, ' ').trim();
+          if (excerpt) {
+            const preview = document.createElement('p');
+            preview.textContent = excerpt.length > 600 ? `${excerpt.slice(0, 600)}...` : excerpt;
+            item.append(preview);
+          }
+          sourceList.append(item);
+        });
+        disclosure.append(summary, sourceList);
+        assistantMessage.append(disclosure);
+      }
+
+      article.append(userMessage, assistantMessage);
+      conversation.append(article);
+    }
+
+    function renderHistory(turns) {
+      conversation.replaceChildren();
+      if (!turns.length) {
+        const empty = document.createElement('p');
+        empty.textContent = 'No messages yet.';
+        conversation.append(empty);
+        return;
+      }
+      turns.forEach(renderTurn);
+    }
+
+    async function restoreSession() {
+      const savedSessionId = localStorage.getItem('rag-session-id');
+      if (!savedSessionId) return;
+      try {
+        const historyResponse = await fetch(`/sessions/${savedSessionId}/history`);
+        if (!historyResponse.ok) throw new Error(await readError(historyResponse));
+        const turns = await historyResponse.json();
+        sessionId = savedSessionId;
+        sessionLabel.textContent = sessionId;
+        renderHistory(turns);
+
+        const documentsResponse = await fetch(`/sessions/${sessionId}/documents`);
+        const activeSession = documentsResponse.ok;
+        uploadButton.disabled = !activeSession;
+        questionInput.disabled = !activeSession;
+        if (activeSession) {
+          const documents = await documentsResponse.json();
+          askButton.disabled = !documents.some(document => document.status === 'completed');
+          showStatus('Conversation restored.', 'success');
+        } else {
+          showStatus('Conversation restored. Create a new session to continue chatting.', 'success');
+        }
+      } catch {
+        localStorage.removeItem('rag-session-id');
+        showStatus('Previous conversation could not be restored. Create a session to start chatting.');
+      }
+    }
 
     function renderSelectedFiles() {
       selectedFilesLabel.replaceChildren();
@@ -142,39 +245,6 @@
     function showStatus(message, kind = '') {
       status.textContent = message;
       status.className = kind;
-    }
-
-    function showAnswerSources(sources) {
-      status.replaceChildren();
-      status.className = 'success';
-
-      const disclosure = document.createElement('details');
-      disclosure.className = 'source-disclosure';
-      const summary = document.createElement('summary');
-      summary.textContent = `Answered using ${sources.length} source(s).`;
-      disclosure.append(summary);
-
-      const sourceList = document.createElement('ol');
-      sourceList.className = 'source-list';
-      sources.forEach((source, index) => {
-        const item = document.createElement('li');
-        const metadata = source.metadata || {};
-        const label = metadata.title || metadata.filename || metadata.file_name || metadata.source || metadata.url;
-        const heading = document.createElement('h3');
-        heading.className = 'source-heading';
-        heading.textContent = typeof label === 'string' ? label : `Source ${index + 1}`;
-        item.append(heading);
-
-        const excerpt = (source.content || '').replace(/\s+/g, ' ').trim();
-        if (excerpt) {
-          const preview = document.createElement('p');
-          preview.textContent = excerpt.length > 240 ? `${excerpt.slice(0, 240)}...` : excerpt;
-          item.append(preview);
-        }
-        sourceList.append(item);
-      });
-      disclosure.append(sourceList);
-      status.append(disclosure);
     }
 
     function showEvaluation(evaluation = {}, taskStatus = 'completed') {
@@ -229,9 +299,12 @@
         const session = await response.json();
         evaluationRequestNumber += 1;
         sessionId = session.session_id;
+        localStorage.setItem('rag-session-id', sessionId);
         sessionLabel.textContent = sessionId;
         uploadButton.disabled = false;
         questionInput.disabled = false;
+        askButton.disabled = true;
+        renderHistory([]);
         showStatus('Session created. Choose files or enter URLs, then add your sources.', 'success');
       } catch (error) {
         showStatus(`Session creation failed: ${error.message}`, 'error');
@@ -286,9 +359,8 @@
         });
         if (!response.ok) throw new Error(await readError(response));
         const result = await response.json();
-        answer.textContent = result.answer;
+        renderTurn(result);
         showEvaluation(result.evaluation, 'pending');
-        showAnswerSources(result.sources || []);
         void pollEvaluation(result.evaluation_id, requestNumber);
       } catch (error) {
         showStatus(`Chat failed: ${error.message}`, 'error');
@@ -296,6 +368,8 @@
         askButton.disabled = false;
       }
     });
+
+    void restoreSession();
   </script>
 </body>
 </html>

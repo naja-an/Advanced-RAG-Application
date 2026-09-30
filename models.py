@@ -71,6 +71,15 @@ class ChatResponse(BaseModel):
 	evaluation_id: UUID
 
 
+class ChatTurnResponse(BaseModel):
+	turn_id: int
+	question: str
+	query_used_for_retrieval: str
+	answer: str
+	sources: list[SourceResponse] = Field(default_factory=list)
+	created_at: datetime
+
+
 class MessageResponse(BaseModel):
 	role: str
 	content: str

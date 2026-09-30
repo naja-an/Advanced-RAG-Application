@@ -21,6 +21,7 @@ from evaluation_tasks import run_answer_evaluation
 from models import (
 	ChatRequest,
 	ChatResponse,
+	ChatTurnResponse,
 	DocumentResponse,
 	EvaluationResponse,
 	EvaluationTaskResponse,
@@ -53,6 +54,7 @@ def _build_pipeline(documents: list[object]) -> RAGPipeline:
 		model=os.getenv("RAG_MODEL", "gemini-3.5-flash-lite"),
 		temperature=0,
 		max_output_tokens=512,
+		max_retries=0
 	)
 	embedding = GoogleGenerativeAIEmbeddings(
 		model=os.getenv("RAG_EMBEDDING_MODEL", "gemini-embedding-2-preview")
@@ -97,6 +99,21 @@ async def delete_session(session_id: UUID) -> None:
 	_session_or_404(session_id)
 	session_manager.delete(session_id)
 	logger.info("session_deleted session_id=%s", session_id)
+
+
+@app.get(
+	"/sessions/{session_id}/history",
+	response_model=list[ChatTurnResponse],
+	responses={404: {"model": ErrorResponse}},
+)
+async def get_history(session_id: UUID) -> list[ChatTurnResponse]:
+	history = await asyncio.to_thread(session_manager.list_history, session_id)
+	if history is None:
+		raise HTTPException(
+			status_code=status.HTTP_404_NOT_FOUND,
+			detail=f"Session {session_id} was not found",
+		)
+	return history
 
 
 @app.get(
@@ -234,6 +251,7 @@ async def chat(
 	try:
 		result = await session.pipeline.generate_answer(
 			request.question,
+			memory=session.memory,
 			config=config,
 		)
 	except RAGException as error:
@@ -268,7 +286,7 @@ async def chat(
 
 	return ChatResponse(
 		question=request.question,
-		query_used_for_retrieval=request.question,
+		query_used_for_retrieval=result["query_used_for_retrieval"],
 		answer=result["answer"],
 		evaluation=EvaluationResponse(latency_ms=latency),
 		evaluation_id=evaluation_id,
