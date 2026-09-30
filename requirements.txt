@@ -1,16 +1,23 @@
-langchain-docling
-faiss-cpu
-rank_bm25
-langchain-google-genai
-python-dotenv
-docling
-langchain
-langchain-community
-langchain-core
-langchain-classic
-sentence-transformers
-langfuse
+# Runtime
 fastapi
 uvicorn[standard]
 python-multipart
+pydantic-settings
+python-dotenv
+tenacity>=8.3
+
+# RAG
+langchain
+langchain-core
+langchain-classic
+langchain-community
+langchain-google-genai
+langchain-docling
+docling
+faiss-cpu
+rank_bm25
+sentence-transformers
+
+# Observability & evaluation
+langfuse
 deepeval
